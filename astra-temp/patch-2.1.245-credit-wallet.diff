@@ -1,0 +1,914 @@
+diff --git a/api/src/server.js b/api/src/server.js
+index 8b6f4c58..621e8d89 100644
+--- a/api/src/server.js
++++ b/api/src/server.js
+@@ -29,6 +29,9 @@ const RAID_REPLAY_HZ_VPS = 30;
+ const MAX_RAID_REPLAY_STEPS_VPS = RAID_REPLAY_HZ_VPS * 10 * 60;
+ const MAX_RAID_REPLAY_INPUTS_VPS = 240;
+ const MAX_RAID_REPLAY_ACTORS_VPS = 5;
++const SORCERER_CREDIT_REDEEM_CENTS_VPS = 5000;
++const SORCERER_CREDIT_REDEEM_EUROS_VPS =
++  SORCERER_CREDIT_REDEEM_CENTS_VPS / 100;
+ 
+ const clampInt = (value, min, max) => {
+   const number = Number(value);
+@@ -1145,6 +1148,192 @@ const normalizeSearchTextVps = (value) =>
+     .toLowerCase()
+     .trim();
+ 
++const creditSnapshotVps = (row = {}) => {
++  const cents = Math.max(
++    0,
++    Math.round(Number(row?.balance_cents || 0)),
++  );
++  return {
++    cents,
++    euros: cents / 100,
++    lifetimeCents: Math.max(
++      0,
++      Math.round(Number(row?.lifetime_cents || 0)),
++    ),
++    redeemThresholdCents:
++      SORCERER_CREDIT_REDEEM_CENTS_VPS,
++    redeemThresholdEuros:
++      SORCERER_CREDIT_REDEEM_EUROS_VPS,
++    canRedeem:
++      cents >= SORCERER_CREDIT_REDEEM_CENTS_VPS,
++  };
++};
++
++const sorcererExchangeCodeVps = (
++  email,
++  redeemKey,
++) => {
++  const suffix = crypto
++    .createHash("sha256")
++    .update(
++      String(email || "").toLowerCase() +
++        "|" +
++        String(redeemKey || ""),
++      "utf8",
++    )
++    .digest("hex")
++    .slice(0, 12)
++    .toUpperCase();
++  return "SORCIER50-" + suffix;
++};
++
++async function ensureCreditWalletTx(
++  client,
++  email,
++  name = "",
++) {
++  const normalized = normalizeMirrorEmail(email);
++  if (!normalized) {
++    throw makeHttpError(
++      400,
++      "Compte Crédit Sorcier invalide.",
++    );
++  }
++
++  await client.query(
++    `INSERT INTO astra_credit_wallets
++       (user_email, user_name, balance_cents,
++        lifetime_cents, updated_at)
++     VALUES ($1, $2, 0, 0, NOW())
++     ON CONFLICT (user_email)
++     DO UPDATE SET
++       user_name = CASE
++         WHEN EXCLUDED.user_name <> ''
++           THEN EXCLUDED.user_name
++         ELSE astra_credit_wallets.user_name
++       END`,
++    [
++      normalized,
++      String(name || "").trim().slice(0, 160),
++    ],
++  );
++
++  const result = await client.query(
++    `SELECT *
++       FROM astra_credit_wallets
++      WHERE user_email = $1
++      LIMIT 1
++      FOR UPDATE`,
++    [normalized],
++  );
++  return result.rows[0];
++}
++
++async function applyCreditDeltaTx(
++  client,
++  {
++    email,
++    name = "",
++    deltaCents = 0,
++    eventKey = "",
++    reason = "",
++    refId = "",
++  },
++) {
++  const normalized = normalizeMirrorEmail(email);
++  const key = String(eventKey || "")
++    .trim()
++    .slice(0, 240);
++  if (!normalized || !key) {
++    throw makeHttpError(
++      400,
++      "Évènement Crédit Sorcier invalide.",
++    );
++  }
++
++  const existing = await client.query(
++    `SELECT delta_cents, balance_after_cents
++       FROM astra_credit_events
++      WHERE event_key = $1
++      LIMIT 1`,
++    [key],
++  );
++  if (existing.rowCount) {
++    const wallet = await ensureCreditWalletTx(
++      client,
++      normalized,
++      name,
++    );
++    return {
++      duplicate: true,
++      appliedCents: 0,
++      wallet,
++      event: existing.rows[0],
++    };
++  }
++
++  const wallet = await ensureCreditWalletTx(
++    client,
++    normalized,
++    name,
++  );
++  const before = Math.max(
++    0,
++    Math.round(Number(wallet.balance_cents || 0)),
++  );
++  const requested = Math.round(
++    Number(deltaCents || 0),
++  );
++  const after = Math.max(0, before + requested);
++  const applied = after - before;
++  const lifetimeAfter =
++    Math.max(
++      0,
++      Math.round(Number(wallet.lifetime_cents || 0)),
++    ) + Math.max(0, applied);
++
++  const saved = await client.query(
++    `UPDATE astra_credit_wallets
++        SET balance_cents = $2,
++            lifetime_cents = $3,
++            user_name = CASE
++              WHEN $4 <> '' THEN $4
++              ELSE user_name
++            END,
++            updated_at = NOW()
++      WHERE user_email = $1
++      RETURNING *`,
++    [
++      normalized,
++      after,
++      lifetimeAfter,
++      String(name || "").trim().slice(0, 160),
++    ],
++  );
++
++  await client.query(
++    `INSERT INTO astra_credit_events
++       (event_key, user_email, delta_cents,
++        balance_after_cents, reason, ref_id,
++        created_at)
++     VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
++    [
++      key,
++      normalized,
++      applied,
++      after,
++      String(reason || "").slice(0, 120),
++      String(refId || "").slice(0, 180),
++    ],
++  );
++
++  return {
++    duplicate: false,
++    appliedCents: applied,
++    wallet: saved.rows[0],
++  };
++}
++
+ const stableRollVps = (seed, min, max, salt = "") => {
+   const text = `${String(seed || "")}|${salt}`;
+   let hash = 2166136261;
+@@ -1747,6 +1936,47 @@ await pool.query(`
+   ADD COLUMN IF NOT EXISTS revenge_raid_id TEXT
+ `);
+ 
++await pool.query(`
++  CREATE TABLE IF NOT EXISTS astra_credit_wallets (
++    user_email TEXT PRIMARY KEY,
++    user_name TEXT NOT NULL DEFAULT '',
++    balance_cents BIGINT NOT NULL DEFAULT 0,
++    lifetime_cents BIGINT NOT NULL DEFAULT 0,
++    imported_at TIMESTAMPTZ,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++  )
++`);
++
++await pool.query(`
++  CREATE TABLE IF NOT EXISTS astra_credit_events (
++    event_key TEXT PRIMARY KEY,
++    user_email TEXT NOT NULL,
++    delta_cents BIGINT NOT NULL,
++    balance_after_cents BIGINT NOT NULL,
++    reason TEXT NOT NULL DEFAULT '',
++    ref_id TEXT NOT NULL DEFAULT '',
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++  )
++`);
++
++await pool.query(`
++  CREATE INDEX IF NOT EXISTS astra_credit_events_user_idx
++  ON astra_credit_events (user_email, created_at DESC)
++`);
++
++await pool.query(`
++  CREATE TABLE IF NOT EXISTS astra_credit_redemptions (
++    user_email TEXT NOT NULL,
++    redeem_key TEXT NOT NULL,
++    source_id TEXT NOT NULL,
++    code TEXT NOT NULL,
++    status TEXT NOT NULL DEFAULT 'active',
++    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    PRIMARY KEY (user_email, redeem_key),
++    UNIQUE (code)
++  )
++`);
++
+ await pool.query(`
+   CREATE TABLE IF NOT EXISTS astra_settings (
+     setting_key TEXT PRIMARY KEY,
+@@ -3929,6 +4159,138 @@ app.post("/v1/raid/resolve", { preHandler: requireAstraAuth }, async (request, r
+       "loss",
+     );
+ 
++    const creditWinnerEmail = won
++      ? attackerEmail
++      : defenderEmail;
++    const creditLoserEmail = won
++      ? defenderEmail
++      : attackerEmail;
++    const creditWinnerName = won
++      ? String(raid.attacker_name || "")
++      : String(raid.defender_name || "");
++    const creditLoserName = won
++      ? String(raid.defender_name || "")
++      : String(raid.attacker_name || "");
++
++    let creditLostCents = 0;
++    let creditWinnerBalanceAfter = 0;
++    let creditLoserBalanceAfter = 0;
++    let creditSettled = false;
++
++    const creditMigrationReadyResult =
++      await client.query(
++        `SELECT value
++           FROM astra_settings
++          WHERE setting_key =
++            'astra_credit_migration'
++          LIMIT 1`,
++      );
++    const creditMigrationReady =
++      creditMigrationReadyResult.rows?.[0]?.value
++        ?.ready === true;
++
++    const creditMigration = await client.query(
++      `SELECT user_email, imported_at
++         FROM astra_credit_wallets
++        WHERE user_email = ANY($1::text[])`,
++      [[creditWinnerEmail, creditLoserEmail]],
++    );
++    const importedCreditEmails = new Set(
++      (creditMigration.rows || [])
++        .filter((row) => row?.imported_at)
++        .map((row) =>
++          normalizeMirrorEmail(row.user_email),
++        ),
++    );
++
++    if (
++      creditMigrationReady ||
++      (
++        importedCreditEmails.has(
++          creditWinnerEmail,
++        ) &&
++        importedCreditEmails.has(
++          creditLoserEmail,
++        )
++      )
++    ) {
++      const creditEventBase =
++        "ASTRA_RAID_CREDIT:" +
++        String(raid.id || token);
++
++      const loserWallet =
++        await ensureCreditWalletTx(
++          client,
++          creditLoserEmail,
++          creditLoserName,
++        );
++      const loserBalance = Math.max(
++        0,
++        Math.round(
++          Number(loserWallet.balance_cents || 0),
++        ),
++      );
++      creditLostCents =
++        loserBalance > 0
++          ? Math.min(
++              loserBalance,
++              Math.max(
++                1,
++                Math.floor(
++                  (loserBalance * creditLossPct) /
++                    100,
++                ),
++              ),
++            )
++          : 0;
++
++      const lossSettlement =
++        creditLostCents > 0
++          ? await applyCreditDeltaTx(client, {
++              email: creditLoserEmail,
++              name: creditLoserName,
++              deltaCents: -creditLostCents,
++              eventKey:
++                creditEventBase + ":loss",
++              reason: "raid_loss",
++              refId: String(raid.id || token),
++            })
++          : {
++              wallet: loserWallet,
++              appliedCents: 0,
++            };
++
++      const winSettlement =
++        await applyCreditDeltaTx(client, {
++          email: creditWinnerEmail,
++          name: creditWinnerName,
++          deltaCents: creditGainCents,
++          eventKey: creditEventBase + ":win",
++          reason: "raid_win",
++          refId: String(raid.id || token),
++        });
++
++      creditLoserBalanceAfter = Math.max(
++        0,
++        Math.round(
++          Number(
++            lossSettlement.wallet?.balance_cents ||
++              0,
++          ),
++        ),
++      );
++      creditWinnerBalanceAfter = Math.max(
++        0,
++        Math.round(
++          Number(
++            winSettlement.wallet?.balance_cents ||
++              0,
++          ),
++        ),
++      );
++      creditSettled = true;
++    }
++
+     const { config: adminConfig } =
+       await loadVpsAdminConfig();
+     const raidChestChance = clampNumberVps(
+@@ -4101,6 +4463,14 @@ app.post("/v1/raid/resolve", { preHandler: requireAstraAuth }, async (request, r
+       raid_chest: raidChestReward,
+       credit_gain_cents: creditGainCents,
+       credit_loss_pct: creditLossPct,
++      credit_lost_cents: creditLostCents,
++      credit_winner_email: creditWinnerEmail,
++      credit_loser_email: creditLoserEmail,
++      credit_settled: creditSettled,
++      credit_winner_balance_after_cents:
++        creditWinnerBalanceAfter,
++      credit_loser_balance_after_cents:
++        creditLoserBalanceAfter,
+       replay,
+       resolved_at: nowIso,
+     };
+@@ -4166,6 +4536,10 @@ app.post("/v1/raid/resolve", { preHandler: requireAstraAuth }, async (request, r
+               credit_winner_email = $10,
+               credit_loser_email = $11,
+               replay = $12::jsonb,
++              credit_lost_cents = $13,
++              credit_settled = $14,
++              credit_winner_balance_after_cents = $15,
++              credit_loser_balance_after_cents = $16,
+               resolved_at = NOW(),
+               updated_at = NOW()
+         WHERE id = $1
+@@ -4180,9 +4554,13 @@ app.post("/v1/raid/resolve", { preHandler: requireAstraAuth }, async (request, r
+         destruction,
+         creditGainCents,
+         creditLossPct,
+-        won ? attackerEmail : defenderEmail,
+-        won ? defenderEmail : attackerEmail,
++        creditWinnerEmail,
++        creditLoserEmail,
+         replay ? JSON.stringify(replay) : null,
++        creditLostCents,
++        creditSettled,
++        creditWinnerBalanceAfter,
++        creditLoserBalanceAfter,
+       ],
+     );
+ 
+@@ -4219,11 +4597,19 @@ app.post("/v1/raid/resolve", { preHandler: requireAstraAuth }, async (request, r
+       mana_stolen: manaStolen,
+       credit_gain_cents: creditGainCents,
+       credit_loss_pct: creditLossPct,
+-      credit_lost_cents: 0,
+-      attacker_credit_delta_cents: won
+-        ? creditGainCents
++      credit_lost_cents: creditLostCents,
++      attacker_credit_delta_cents: creditSettled
++        ? won
++          ? creditGainCents
++          : -creditLostCents
+         : 0,
+-      attacker_credit_balance_after_cents: 0,
++      attacker_credit_balance_after_cents:
++        creditSettled
++          ? won
++            ? creditWinnerBalanceAfter
++            : creditLoserBalanceAfter
++          : 0,
++      credit_settled: creditSettled,
+       attacker_gold_after: Math.max(
+         0,
+         Number(attackerResources.gold || 0),
+@@ -4247,6 +4633,453 @@ app.post("/v1/raid/resolve", { preHandler: requireAstraAuth }, async (request, r
+   }
+ });
+ 
++app.get("/v1/credits/state", { preHandler: requireAstraAuth }, async (request) => {
++  const email = normalizeMirrorEmail(
++    request.astraUser.email,
++  );
++  const result = await pool.query(
++    `SELECT *
++       FROM astra_credit_wallets
++      WHERE user_email = $1
++      LIMIT 1`,
++    [email],
++  );
++  const wallet = result.rows?.[0] || {
++    balance_cents: 0,
++    lifetime_cents: 0,
++  };
++  return {
++    ok: true,
++    credit: creditSnapshotVps(wallet),
++    source: "vps",
++  };
++});
++
++app.post("/v1/credits/redeem", { preHandler: requireAstraAuth }, async (request, reply) => {
++  const email = normalizeMirrorEmail(
++    request.astraUser.email,
++  );
++  const name = String(
++    request.astraUser?.name ||
++      request.astraUser?.full_name ||
++      email.split("@")[0] ||
++      "",
++  )
++    .trim()
++    .slice(0, 160);
++  const redeemKey = String(
++    request.body?.redeem_key || "",
++  )
++    .trim()
++    .slice(0, 120);
++
++  if (!redeemKey) {
++    return reply.code(400).send({
++      ok: false,
++      error: "Demande d’échange invalide.",
++    });
++  }
++
++  const client = await pool.connect();
++  try {
++    await client.query("BEGIN");
++    await client.query(
++      "SELECT pg_advisory_xact_lock(hashtext($1))",
++      [email],
++    );
++
++    const existing = await client.query(
++      `SELECT *
++         FROM astra_credit_redemptions
++        WHERE user_email = $1
++          AND redeem_key = $2
++        LIMIT 1`,
++      [email, redeemKey],
++    );
++
++    if (existing.rowCount) {
++      const wallet = await ensureCreditWalletTx(
++        client,
++        email,
++        name,
++      );
++      await client.query("COMMIT");
++      const row = existing.rows[0];
++      return {
++        ok: true,
++        duplicate: true,
++        code: row.code,
++        promo: {
++          code: row.code,
++          source_reward_id: row.source_id,
++          wheel_name: "Crédit Sorcier",
++          reward_label:
++            "50 € de réduction — Crédit Sorcier",
++          discount_type: "fixed",
++          discount_value:
++            SORCERER_CREDIT_REDEEM_EUROS_VPS,
++          status: row.status || "active",
++        },
++        exchangedCents:
++          SORCERER_CREDIT_REDEEM_CENTS_VPS,
++        exchangedEuros:
++          SORCERER_CREDIT_REDEEM_EUROS_VPS,
++        credit: creditSnapshotVps(wallet),
++        source: "vps",
++      };
++    }
++
++    const wallet = await ensureCreditWalletTx(
++      client,
++      email,
++      name,
++    );
++    const balance = Math.max(
++      0,
++      Math.round(Number(wallet.balance_cents || 0)),
++    );
++
++    if (
++      balance <
++      SORCERER_CREDIT_REDEEM_CENTS_VPS
++    ) {
++      await client.query("ROLLBACK");
++      return reply.code(400).send({
++        ok: false,
++        error:
++          "Il faut 50,00 € de Crédit Sorcier pour créer ce code promo.",
++        requiredCents:
++          SORCERER_CREDIT_REDEEM_CENTS_VPS,
++        missingCents:
++          SORCERER_CREDIT_REDEEM_CENTS_VPS -
++          balance,
++        credit: creditSnapshotVps(wallet),
++      });
++    }
++
++    const sourceId =
++      "sorcerer_credit_exchange:" + redeemKey;
++    const eventKey =
++      "WIZARD_CREDIT_REDEEM:" + redeemKey;
++    const code = sorcererExchangeCodeVps(
++      email,
++      redeemKey,
++    );
++
++    const debit = await applyCreditDeltaTx(
++      client,
++      {
++        email,
++        name,
++        deltaCents:
++          -SORCERER_CREDIT_REDEEM_CENTS_VPS,
++        eventKey,
++        reason: "redeem",
++        refId: sourceId,
++      },
++    );
++
++    await client.query(
++      `INSERT INTO astra_credit_redemptions
++         (user_email, redeem_key, source_id,
++          code, status, created_at)
++       VALUES ($1, $2, $3, $4, 'active', NOW())`,
++      [email, redeemKey, sourceId, code],
++    );
++
++    await client.query("COMMIT");
++
++    return {
++      ok: true,
++      code,
++      promo: {
++        code,
++        source_reward_id: sourceId,
++        wheel_name: "Crédit Sorcier",
++        reward_label:
++          "50 € de réduction — Crédit Sorcier",
++        discount_type: "fixed",
++        discount_value:
++          SORCERER_CREDIT_REDEEM_EUROS_VPS,
++        status: "active",
++      },
++      exchangedCents:
++        SORCERER_CREDIT_REDEEM_CENTS_VPS,
++      exchangedEuros:
++        SORCERER_CREDIT_REDEEM_EUROS_VPS,
++      credit: creditSnapshotVps(debit.wallet),
++      source: "vps",
++      backup: {
++        action: "redeemSorcererCredit",
++        redeemKey,
++      },
++    };
++  } catch (error) {
++    await client.query("ROLLBACK").catch(() => null);
++    throw error;
++  } finally {
++    client.release();
++  }
++});
++
++app.get("/v1/admin/credits/status", { preHandler: requireAstraAuth }, async (request, reply) => {
++  if (!isAstraAdminUser(request.astraUser)) {
++    return reply.code(403).send({
++      ok: false,
++      error: "Accès administrateur refusé.",
++    });
++  }
++
++  const migration = await pool.query(
++    `SELECT value, updated_at
++       FROM astra_settings
++      WHERE setting_key =
++        'astra_credit_migration'
++      LIMIT 1`,
++  );
++  const result = await pool.query(
++    `SELECT
++       COUNT(*)::int AS wallets,
++       COUNT(*) FILTER (
++         WHERE imported_at IS NOT NULL
++       )::int AS imported,
++       COALESCE(SUM(balance_cents), 0)::bigint
++         AS total_balance_cents
++     FROM astra_credit_wallets`,
++  );
++  const events = await pool.query(
++    `SELECT COUNT(*)::int AS events
++       FROM astra_credit_events`,
++  );
++  const redemptions = await pool.query(
++    `SELECT COUNT(*)::int AS redemptions
++       FROM astra_credit_redemptions`,
++  );
++
++  return {
++    ok: true,
++    wallets: Number(
++      result.rows?.[0]?.wallets || 0,
++    ),
++    imported: Number(
++      result.rows?.[0]?.imported || 0,
++    ),
++    total_balance_cents: Number(
++      result.rows?.[0]?.total_balance_cents || 0,
++    ),
++    events: Number(
++      events.rows?.[0]?.events || 0,
++    ),
++    redemptions: Number(
++      redemptions.rows?.[0]?.redemptions || 0,
++    ),
++    migration_ready:
++      migration.rows?.[0]?.value?.ready === true,
++    migration_updated_at:
++      migration.rows?.[0]?.updated_at || null,
++    source: "vps",
++  };
++});
++
++app.post("/v1/admin/credits/import", { preHandler: requireAstraAuth }, async (request, reply) => {
++  if (!isAstraAdminUser(request.astraUser)) {
++    return reply.code(403).send({
++      ok: false,
++      error: "Accès administrateur refusé.",
++    });
++  }
++
++  const profiles = (
++    Array.isArray(request.body?.profiles)
++      ? request.body.profiles
++      : []
++  ).slice(0, 500);
++  const redemptions = (
++    Array.isArray(request.body?.redemptions)
++      ? request.body.redemptions
++      : []
++  ).slice(0, 500);
++  const final = request.body?.final === true;
++
++  const client = await pool.connect();
++  let imported = 0;
++  let skipped = 0;
++  let importedRedemptions = 0;
++
++  try {
++    await client.query("BEGIN");
++
++    for (const profile of profiles) {
++      const email = normalizeMirrorEmail(
++        profile?.user_email,
++      );
++      if (!email) {
++        skipped += 1;
++        continue;
++      }
++
++      await client.query(
++        "SELECT pg_advisory_xact_lock(hashtext($1))",
++        [email],
++      );
++
++      const existing = await client.query(
++        `SELECT *,
++          (SELECT COUNT(*)::int
++             FROM astra_credit_events e
++            WHERE e.user_email =
++              astra_credit_wallets.user_email)
++            AS event_count
++           FROM astra_credit_wallets
++          WHERE user_email = $1
++          LIMIT 1
++          FOR UPDATE`,
++        [email],
++      );
++
++      const row = existing.rows?.[0];
++      if (
++        row &&
++        (
++          row.imported_at ||
++          Number(row.event_count || 0) > 0
++        )
++      ) {
++        skipped += 1;
++        continue;
++      }
++
++      const balance = Math.max(
++        0,
++        Math.round(
++          Number(
++            profile?.sorcerer_credit_cents || 0,
++          ),
++        ),
++      );
++      const lifetime = Math.max(
++        balance,
++        Math.round(
++          Number(
++            profile?.sorcerer_credit_lifetime_cents ||
++              balance,
++          ),
++        ),
++      );
++      const name = String(
++        profile?.user_name || "",
++      )
++        .trim()
++        .slice(0, 160);
++
++      await client.query(
++        `INSERT INTO astra_credit_wallets
++           (user_email, user_name,
++            balance_cents, lifetime_cents,
++            imported_at, updated_at)
++         VALUES ($1, $2, $3, $4, NOW(), NOW())
++         ON CONFLICT (user_email)
++         DO UPDATE SET
++           user_name = EXCLUDED.user_name,
++           balance_cents =
++             EXCLUDED.balance_cents,
++           lifetime_cents =
++             EXCLUDED.lifetime_cents,
++           imported_at = NOW(),
++           updated_at = NOW()`,
++        [email, name, balance, lifetime],
++      );
++      imported += 1;
++    }
++
++    for (const promo of redemptions) {
++      const email = normalizeMirrorEmail(
++        promo?.user_email,
++      );
++      const sourceId = String(
++        promo?.source_reward_id || "",
++      )
++        .trim()
++        .slice(0, 180);
++      const prefix =
++        "sorcerer_credit_exchange:";
++      if (
++        !email ||
++        !sourceId.startsWith(prefix) ||
++        !promo?.code
++      ) {
++        continue;
++      }
++
++      const redeemKey = sourceId
++        .slice(prefix.length)
++        .slice(0, 120);
++      if (!redeemKey) continue;
++
++      await client.query(
++        `INSERT INTO astra_credit_redemptions
++           (user_email, redeem_key, source_id,
++            code, status, created_at)
++         VALUES ($1, $2, $3, $4, $5, NOW())
++         ON CONFLICT (user_email, redeem_key)
++         DO NOTHING`,
++        [
++          email,
++          redeemKey,
++          sourceId,
++          String(promo.code).slice(0, 120),
++          ["active", "used", "expired"].includes(
++            String(promo?.status || ""),
++          )
++            ? String(promo.status)
++            : "active",
++        ],
++      );
++      importedRedemptions += 1;
++    }
++
++    if (final) {
++      await client.query(
++        `INSERT INTO astra_settings
++           (setting_key, revision, value,
++            updated_at)
++         VALUES
++           ('astra_credit_migration', 1,
++            $1::jsonb, NOW())
++         ON CONFLICT (setting_key)
++         DO UPDATE SET
++           revision =
++             astra_settings.revision + 1,
++           value = EXCLUDED.value,
++           updated_at = NOW()`,
++        [
++          JSON.stringify({
++            ready: true,
++            completed_at:
++              new Date().toISOString(),
++          }),
++        ],
++      );
++    }
++
++    await client.query("COMMIT");
++    return {
++      ok: true,
++      imported,
++      skipped,
++      imported_redemptions:
++        importedRedemptions,
++      migration_ready: final,
++      source: "vps",
++    };
++  } catch (error) {
++    await client.query("ROLLBACK").catch(() => null);
++    throw error;
++  } finally {
++    client.release();
++  }
++});
++
+ app.post("/v1/daily-gift/claim", { preHandler: requireAstraAuth }, async (request, reply) => {
+   const user = request.astraUser;
+   const client = await pool.connect();
