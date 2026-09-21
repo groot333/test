@@ -48,9 +48,13 @@ NEW_ERROR = 'app.setErrorHandler((error, request, reply) => {\n  request.log.err
 marker = "app.setErrorHandler((error, request, reply) => {"
 if marker in text:
     start = text.index(marker)
-    port_marker = "\n\nconst port ="
-    end = text.index(port_marker, start)
-    text = text[:start] + NEW_ERROR + text[end:]
+    port_marker = "const port ="
+    end = text.find(port_marker, start)
+    if end < 0:
+        raise SystemExit("ERREUR : fin du serveur introuvable après setErrorHandler.")
+    prefix = text[:start]
+    suffix = text[end:]
+    text = prefix + NEW_ERROR.rstrip() + "\n\n" + suffix.lstrip()
     print("OK : gestion des erreurs VPS mise à jour.")
 else:
     raise SystemExit("ERREUR : gestionnaire d'erreurs introuvable.")
